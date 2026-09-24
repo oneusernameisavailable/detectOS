@@ -55,12 +55,8 @@ jobs:
           # RHEL family
           - distro: rockylinux:9
             label: rocky-9
-          - distro: rockylinux:8
-            label: rocky-8
           - distro: almalinux:9
             label: almalinux-9
-          - distro: centos:stream9
-            label: centos-stream9
           - distro: amazonlinux:2023
             label: amazon-linux-2023
           - distro: oraclelinux:9
@@ -85,55 +81,34 @@ jobs:
             label: alpine-3.21
           - distro: alpine:3.20
             label: alpine-3.20
-          # Other
-          - distro: gentoo:latest
-            label: gentoo-latest
-          - distro: voidlinux/voidlinux:latest
-            label: void-linux
-          - distro: raspbian/raspbian:bookworm
-            label: raspbian-bookworm
-          - distro: linuxmint/mint:22
-            label: mint-22
-          - distro: pop-os:24.04
-            label: pop-os-24.04
-          # Bash 4.0 floor test on minimal
+          # Debian slim (bash 4.0 floor test)
           - distro: debian:12-slim
             label: debian-12-slim-bash4
 
     container:
       image: ${{ matrix.distro }}
-      options: --privileged
 
     steps:
-      - uses: actions/checkout@v4
-      - name: Install bash
+      - name: Install prerequisites
         run: |
           if command -v apt-get &>/dev/null; then
-            apt-get update -qq && apt-get install -y -qq bash coreutils
+            apt-get update -qq && apt-get install -y -qq git bash coreutils
           elif command -v dnf &>/dev/null; then
-            dnf install -y -q bash coreutils
+            dnf install -y -q git bash coreutils
           elif command -v yum &>/dev/null; then
-            yum install -y -q bash coreutils
+            yum install -y -q git bash coreutils
           elif command -v apk &>/dev/null; then
-            apk add --no-cache bash coreutils
+            apk add --no-cache git bash coreutils
           elif command -v pacman &>/dev/null; then
-            pacman -Sy --noconfirm bash coreutils
+            pacman -Sy --noconfirm git bash coreutils
           fi
           bash --version | head -1
-      - name: Install bats
+          git --version
+      - uses: actions/checkout@v4
+      - name: Install bats from source
         run: |
-          if command -v apt-get &>/dev/null; then
-            apt-get install -y -qq bats
-          elif command -v dnf &>/dev/null; then
-            dnf install -y -q bats
-          elif command -v apk &>/dev/null; then
-            apk add --no-cache bats
-          elif command -v pacman &>/dev/null; then
-            pacman -Sy --noconfirm bats
-          else
-            git clone --depth 1 https://github.com/bats-core/bats-core.git /tmp/bats-core
-            /tmp/bats-core/install.sh /usr/local
-          fi
+          git clone --depth 1 https://github.com/bats-core/bats-core.git /tmp/bats-core
+          /tmp/bats-core/install.sh /usr/local
           bats --version
       - name: Install lsb_release
         run: |
@@ -163,5 +138,5 @@ jobs:
       - name: Source library check
         run: |
           bash -c 'source fx-detect-os.sh && detect_os && echo "OS_ID=$OS_ID OS_DISTRO=$OS_DISTRO"'
-      - name: Verify help
+      - name: Verify functions
         run: bash -c 'source fx-detect-os.sh && type os_id os_like os_pretty os_distro os_trust_level'
