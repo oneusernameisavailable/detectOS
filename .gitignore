@@ -1,0 +1,12 @@
+# Runtime failure log / state (never inside the source tree by default)
+OSDetectFailureLog/
+osdetect-failures.jsonl
+
+# Transient test artifacts (recreated by the bats suite)
+*.forge/
+evilroot/
+
+# Local tooling / eval scaffolding
+.superpowers/
+.threadbridge/
+.adversarial-config.yml
