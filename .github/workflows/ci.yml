@@ -104,7 +104,10 @@ jobs:
           fi
           bash --version | head -1
           git --version
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        run: |
+          git clone --depth 1 https://github.com/oneusernameisavailable/detectOS.git .
+          pwd
       - name: Install bats from source
         run: |
           git clone --depth 1 https://github.com/bats-core/bats-core.git /tmp/bats-core
