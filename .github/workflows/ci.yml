@@ -13,7 +13,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  SHELLCHECK_VERSION: "0.9.0"
+  # Pinned, not tracking upstream main: an unpinned bats + a weekly cron meant
+  # an upstream change could break CI non-deterministically. Bump deliberately.
+  BATS_VERSION: "v1.11.0"
+  # 0.11.0 is the version the source's shellcheck directives are written against
+  # (SC2329 is 0.11-only, so on 0.9.0 those disables were silent no-ops).
+  SHELLCHECK_VERSION: "0.11.0"
 
 jobs:
   shellcheck:
@@ -24,14 +29,18 @@ jobs:
         run: |
           curl -sL https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz | tar xJ
           sudo cp shellcheck-v${SHELLCHECK_VERSION}/shellcheck /usr/local/bin/
+      # No --severity flag: the default (style) is stricter than the previous
+      # --severity=warning, and every file here is already clean at full
+      # severity, so this costs nothing and catches more.
       - name: Lint fx-detect-os.sh
-        run: shellcheck --shell=bash --severity=warning fx-detect-os.sh
+        run: shellcheck --shell=bash fx-detect-os.sh
       - name: Lint test scripts
         run: |
-          shellcheck --shell=bash --severity=warning test/bash40_smoke.sh
-          shellcheck --shell=bash --severity=warning test/fuzz_detect.sh
-          shellcheck --shell=bash --severity=warning test/fuzz_redact.sh
-          shellcheck --shell=bash --severity=warning test/fuzz_sanitize.sh
+          shellcheck --shell=bash test/bash40_smoke.sh
+          shellcheck --shell=bash test/fuzz_detect.sh
+          shellcheck --shell=bash test/fuzz_redact.sh
+          shellcheck --shell=bash test/fuzz_sanitize.sh
+          shellcheck --shell=bash test/detect_os.bats
 
   bats:
     runs-on: ubuntu-latest
@@ -81,9 +90,13 @@ jobs:
             label: alpine-3.21
           - distro: alpine:3.20
             label: alpine-3.20
-          # Debian slim (bash 4.0 floor test)
+          # Minimal-distro coverage (no lsb_release, stripped base image).
+          # This is NOT a bash 4.0 test: the install step above pulls the
+          # DISTRO's bash, which is 5.2 on bookworm. The declared bash >= 4.0
+          # floor is enforced by the separate `bash40` job, which runs the real
+          # bash 4.0 binary.
           - distro: debian:12-slim
-            label: debian-12-slim-bash4
+            label: debian-12-slim
 
     container:
       image: ${{ matrix.distro }}
@@ -97,6 +110,8 @@ jobs:
             dnf install -y -q git bash coreutils
           elif command -v yum &>/dev/null; then
             yum install -y -q git bash coreutils
+          elif command -v zypper &>/dev/null; then
+            zypper --non-interactive --quiet install git bash coreutils
           elif command -v apk &>/dev/null; then
             apk add --no-cache git bash coreutils
           elif command -v pacman &>/dev/null; then
@@ -110,7 +125,7 @@ jobs:
           pwd
       - name: Install bats from source
         run: |
-          git clone --depth 1 https://github.com/bats-core/bats-core.git /tmp/bats-core
+          git clone --depth 1 --branch "$BATS_VERSION" https://github.com/bats-core/bats-core.git /tmp/bats-core
           /tmp/bats-core/install.sh /usr/local
           bats --version
       - name: Install lsb_release
@@ -119,6 +134,8 @@ jobs:
             apt-get install -y -qq lsb-release
           elif command -v dnf &>/dev/null; then
             dnf install -y -q redhat-lsb-core
+          elif command -v zypper &>/dev/null; then
+            zypper --non-interactive --quiet install lsb-release
           elif command -v apk &>/dev/null; then
             apk add --no-cache lsb-release
           fi
@@ -131,6 +148,21 @@ jobs:
           bash test/fuzz_detect.sh fx-detect-os.sh
           bash test/fuzz_redact.sh fx-detect-os.sh
           bash test/fuzz_sanitize.sh fx-detect-os.sh
+
+  bash40:
+    # The header declares a bash >= 4.0 floor. Nothing else in this workflow
+    # proves it: every matrix leg runs INSIDE a container, so the bats suite's
+    # own R18-403 test (which needs docker) skips on all of them, and the
+    # `debian-12-slim` leg installs the distro's bash 5.2. This job runs the
+    # real bash 4.0 binary so the floor is enforced rather than asserted.
+    # `bash:4.0` is a fixed version tag, not `latest`, so this stays reproducible.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Real bash 4.0 floor check
+        run: |
+          docker run --rm -v "$PWD:/work:ro" -w /work bash:4.0 \
+            bash /work/test/bash40_smoke.sh /work/fx-detect-os.sh
 
   quick:
     runs-on: ubuntu-latest
