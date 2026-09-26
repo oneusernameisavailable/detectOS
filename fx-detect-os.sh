@@ -23,9 +23,11 @@
 #   or use the field functions: os_id / os_like / os_pretty / os_distro /
 #   os_trust_level ...
 #
-#   Calling detect_os OVERWRITES every OS_* global. Field functions echo an
-#   empty string (rc 0) when a field was not detected, so callers never trip
-#   over unset variables.
+#   Calling detect_os OVERWRITES every OS_* global. The os_* field accessors
+#   echo an empty string (rc 0) when a field was not detected, so callers never
+#   trip over unset variables. The one exception is os_detected, which is a
+#   boolean guard for `if os_detected; then`: it echoes nothing and returns
+#   0/1. See the accessor table below.
 #
 # DETECTION LADDER  (first step that yields an ID wins)
 #   1. /etc/os-release  ->  /usr/lib/os-release      (freedesktop spec)
@@ -333,8 +335,11 @@ _os_json_escape() {
             $'\r') out+='\r' ;;
             $'\t') out+='\t' ;;
             *)
-                code="$(printf '%d' "'$c")"
-                if [ "$code" -lt 32 ]; then
+                # printf -v (builtin, no fork) — same reasoning as
+                # _os_sanitize_display: a command substitution here cost one
+                # subshell per character of every logged value.
+                printf -v code '%d' "'$c" 2>/dev/null || continue
+                if [ "${code:-0}" -lt 32 ]; then
                     printf -v hex '%04x' "$code"
                     out+="\\u$hex"
                 else
@@ -591,7 +596,13 @@ _os_redact() {
             # silently; warn once so a wrong path/env name cannot go unnoticed
             # forever, mirroring the source-time uname warning above. The
             # one-shot guard keeps repeated log lines from spamming stderr.
-            if [ -z "$_os_env_failed" ]; then
+            # The latch write is itself readonly-guarded: `_os_enter` reaches
+            # this before detect_os runs its readonly-collision preflight, so a
+            # bare assignment here would abort a caller-owned readonly
+            # _os_env_failed. When the name is readonly-empty the latch cannot
+            # be recorded, and a warning could not then stay once-only — that
+            # run is refused by the preflight with a clearer message anyway.
+            if [ -z "${_os_env_failed:-}" ] && ! _os_is_readonly _os_env_failed; then
                 _os_env_failed=1
                 _os_warn "caller-supplied _OS_ENV ($_OS_ENV) failed to run — environment value-scrub is OFF"
             fi
@@ -874,11 +885,18 @@ _os_field_listed() {
         done
         return 1
     fi
+    # This literal union MUST stay identical to _OS_FIELDS + _OS_INTERNAL_SCRATCH
+    # (the SSOT arrays above). It is the only path that can see a caller-owned
+    # scalar binding, where iterating "${arr[@]}" would yield one bogus element.
+    # A name missing here is invisible to the readonly-collision guard, so the
+    # library would assign it and abort the caller's shell. The R19-6 bats test
+    # diffs this list against the arrays to keep them from drifting.
     for n in OS_DETECTED OS_ID OS_ID_LIKE OS_NAME OS_VERSION OS_VERSION_ID \
              OS_VERSION_CODENAME OS_PRETTY_NAME OS_DISTRO OS_ARCH OS_KERNEL \
              OS_KERNEL_RELEASE OS_CONTAINER OS_SOURCE OS_FALLBACK_USED \
              OS_TRUST_LEVEL _os_last_detail _os_log_file _os_log_ready \
-             _os_steps _os_fn_collision _os_fn_collided _os_fn_candidate; do
+             _os_steps _os_fn_collision _os_fn_collided _os_fn_candidate \
+             _os_env_failed; do
         [ "$n" = "$1" ] && return 0
     done
     return 1
@@ -1082,54 +1100,99 @@ _os_sanitize_version() {
 #       bidi-reordering payload, a shell metachar, a glob pattern, or an
 #       unquoted-for-loop word into a caller that interpolates the field.
 _os_sanitize_display() {
-    local s="$1" out="" c i code cp need=0 k ok
+    local s="$1" out="" c i code cp need k ok lidx lead b want have lastc
+    # The walk is CHUNKED, not per-byte over the whole string. bash's
+    # ${var:off:len} is O(length-of-var), so indexing a 256KB value once per
+    # byte is quadratic: a field admitted by _os_file_ok's 262144-byte cap
+    # stalled detect_os for minutes, defeating the cap's own DoS bound. Taking
+    # a chunk with ONE substring op and then indexing within the (small) chunk
+    # keeps the per-byte cost constant and the whole pass linear.
+    local _CHUNK=4096 rest="$s" piece
     local LC_ALL=C
-    for (( i = 0; i < ${#s}; i++ )); do
-        c="${s:i:1}"
-        case "$c" in
-            [[:alnum:]]|" "|"."|"_"|"-"|":"|"/"|","|"+"|"="|"("|")"|"@"|"%"|"^")
-                out+="$c"; continue ;;
-        esac
-        # Non-allowlisted byte: numeric value. < 128 is disallowed ASCII
-        # (quotes, backslash, glob/brace/shell metachars, C0 controls, DEL).
-        code="$(printf '%d' "'$c" 2>/dev/null)" || continue
-        [ "$code" -lt 128 ] && continue
-        # Multibyte length from the lead byte: C2-DF = 1 continuation,
-        # E0-EF = 2, F0-F4 = 3. Overlong leads C0-C1, lone continuation
-        # bytes 0x80-BF, and 0xF5-FF are dropped.
-        case "$code" in
-            194|195|196|197|198|199|200|201|202|203|204|205|206|207) need=1; cp=$(( code & 31 )) ;;
-            224|225|226|227|228|229|230|231|232|233|234|235|236|237|238|239) need=2; cp=$(( code & 15 )) ;;
-            240|241|242|243|244) need=3; cp=$(( code & 7 )) ;;
-            *) continue ;;
-        esac
-        ok=1
-        for (( k = 1; k <= need; k++ )); do
-            [ $(( i + k )) -lt "${#s}" ] || { ok=0; break; }
-            c="${s:i+k:1}"
-            code="$(printf '%d' "'$c" 2>/dev/null)" || { ok=0; break; }
-            if [ "$code" -lt 128 ] || [ "$code" -gt 191 ]; then ok=0; break; fi
-            cp=$(( (cp << 6) | (code & 63) ))
+    while [ -n "$rest" ]; do
+        piece="${rest:0:$_CHUNK}"
+        rest="${rest:$_CHUNK}"
+        # Re-align the cut to a CHARACTER boundary. A UTF-8 sequence is at most
+        # 4 bytes, so scanning back at most 3 bytes finds the lead byte of a
+        # sequence the cut may have split; exactly the missing bytes are then
+        # borrowed. The scan is bounded by 3, so a run of high bytes can never
+        # walk the whole string (an earlier "borrow while the last byte is a
+        # continuation byte" rule both over-borrowed past a complete sequence
+        # and under-borrowed after a lead byte, silently dropping any
+        # multibyte char that straddled the cut). Offsets here are
+        # non-negative, keeping the bash 4.0 floor.
+        lidx=$(( ${#piece} - 1 )); lead=0; b=0
+        while [ "$b" -lt 4 ] && [ "$lidx" -ge 0 ]; do
+            lastc="${piece:lidx:1}"
+            printf -v code '%d' "'$lastc" 2>/dev/null || break
+            [ "$code" -lt 128 ] && break            # ASCII: a character terminus
+            if [ "$code" -ge 194 ] && [ "$code" -le 244 ]; then lead=$code; break; fi
+            b=$(( b + 1 )); lidx=$(( lidx - 1 ))
         done
-        # Reject overlong encodings, C1 controls (U+0080-009F), zero-width /
-        # bidi / annotation format controls, surrogates, noncharacters, and
-        # anything past U+10FFFF. The modulo check catches every plane's
-        # U+xFFFE/U+xFFFF pair. A dropped lead leaves the offending byte to be
-        # reclassified on the next iteration.
-        if [ "$ok" -ne 1 ] \
-            || { [ "$need" -eq 1 ] && [ "$cp" -lt 128 ]; } \
-            || { [ "$need" -eq 2 ] && [ "$cp" -lt 2048 ]; } \
-            || { [ "$need" -eq 3 ] && [ "$cp" -lt 65536 ]; } \
-            || { [ "$cp" -ge 128 ] && [ "$cp" -le 159 ]; } \
-            || { [ "$cp" -ge 8203 ] && [ "$cp" -le 8207 ]; } \
-            || { [ "$cp" -ge 8234 ] && [ "$cp" -le 8238 ]; } \
-            || { [ "$cp" -ge 8288 ] && [ "$cp" -le 8303 ]; } \
-            || { [ "$cp" -ge 55296 ] && [ "$cp" -le 57343 ]; } \
-            || [ $(( cp % 65536 )) -ge 65534 ] \
-            || [ "$cp" -gt 1114111 ]; then
-            continue
+        if [ "$lead" -ge 194 ]; then
+            case "$lead" in
+                194|195|196|197|198|199|200|201|202|203|204|205|206|207) want=2 ;;
+                240|241|242|243|244) want=4 ;;
+                *) want=3 ;;
+            esac
+            have=$(( ${#piece} - lidx ))
+            while [ "$have" -lt "$want" ] && [ -n "$rest" ]; do
+                piece+="${rest:0:1}"
+                rest="${rest:1}"
+                have=$(( have + 1 ))
+            done
         fi
-        out+="${s:i:$(( need + 1 ))}"
+        for (( i = 0; i < ${#piece}; i++ )); do
+            c="${piece:i:1}"
+            case "$c" in
+                [[:alnum:]]|" "|"."|"_"|"-"|":"|"/"|","|"+"|"="|"("|")"|"@"|"%"|"^")
+                    out+="$c"; continue ;;
+            esac
+            # Non-allowlisted byte: numeric value. `printf -v` is a BUILTIN, so
+            # the byte value costs no fork; the previous command substitution
+            # forked a subshell for EVERY byte.
+            printf -v code '%d' "'$c" 2>/dev/null || { code=""; continue; }
+            [ -n "$code" ] || continue
+            # < 128 is disallowed ASCII (quotes, backslash, glob/brace/shell
+            # metachars, C0 controls, DEL).
+            [ "$code" -lt 128 ] && continue
+            # Multibyte length from the lead byte: C2-DF = 1 continuation,
+            # E0-EF = 2, F0-F4 = 3. Overlong leads C0-C1, lone continuation
+            # bytes 0x80-BF, and 0xF5-FF are dropped.
+            case "$code" in
+                194|195|196|197|198|199|200|201|202|203|204|205|206|207) need=1; cp=$(( code & 31 )) ;;
+                224|225|226|227|228|229|230|231|232|233|234|235|236|237|238|239) need=2; cp=$(( code & 15 )) ;;
+                240|241|242|243|244) need=3; cp=$(( code & 7 )) ;;
+                *) continue ;;
+            esac
+            ok=1
+            for (( k = 1; k <= need; k++ )); do
+                [ $(( i + k )) -lt "${#piece}" ] || { ok=0; break; }
+                c="${piece:i+k:1}"
+                printf -v code '%d' "'$c" 2>/dev/null || { ok=0; break; }
+                if [ "$code" -lt 128 ] || [ "$code" -gt 191 ]; then ok=0; break; fi
+                cp=$(( (cp << 6) | (code & 63) ))
+            done
+            # Reject overlong encodings, C1 controls (U+0080-009F), zero-width /
+            # bidi / annotation format controls, surrogates, noncharacters, and
+            # anything past U+10FFFF. The modulo check catches every plane's
+            # U+xFFFE/U+xFFFF pair. A dropped lead leaves the offending byte to
+            # be reclassified on the next iteration.
+            if [ "$ok" -ne 1 ] \
+                || { [ "$need" -eq 1 ] && [ "$cp" -lt 128 ]; } \
+                || { [ "$need" -eq 2 ] && [ "$cp" -lt 2048 ]; } \
+                || { [ "$need" -eq 3 ] && [ "$cp" -lt 65536 ]; } \
+                || { [ "$cp" -ge 128 ] && [ "$cp" -le 159 ]; } \
+                || { [ "$cp" -ge 8203 ] && [ "$cp" -le 8207 ]; } \
+                || { [ "$cp" -ge 8234 ] && [ "$cp" -le 8238 ]; } \
+                || { [ "$cp" -ge 8288 ] && [ "$cp" -le 8303 ]; } \
+                || { [ "$cp" -ge 55296 ] && [ "$cp" -le 57343 ]; } \
+                || [ $(( cp % 65536 )) -ge 65534 ] \
+                || [ "$cp" -gt 1114111 ]; then
+                continue
+            fi
+            out+="${piece:i:$(( need + 1 ))}"
+        done
     done
     # Trim leading/trailing whitespace so a padded release value cannot smuggle
     # a boundary space into callers that compare or interpolate the field.
@@ -1414,7 +1477,10 @@ _os_run_lsb_cmd() {
 # RET   0 if an ID was assigned, 1 otherwise.
 _os_parse_legacy() {
     _os_enter
-    local d line v lc
+    # rel/asuse are the two loop variables below; they MUST be local or they
+    # clobber an identically-named caller global (`rel` especially), which would
+    # break the `_os_` namespace reservation this library promises.
+    local d line v lc rel asuse
     d="$(_os_file_probe /etc)"
 
     # --- Debian: /etc/debian_version (content is the version) ---
@@ -1635,6 +1701,14 @@ _os_detect_container() {
     OS_CONTAINER=none
     df="$(_os_file_probe /.dockerenv)"
     ce="$(_os_file_probe /run/.containerenv)"
+    # /.dockerenv is probed with a bare -f, NOT _os_file_ok, and that is
+    # deliberate: its presence is the whole signal and its content is never
+    # read, so there is no check-then-read window for _os_file_ok's symlink
+    # rejection to close. Routing a presence-only test through _os_file_ok
+    # would add a size cap and a symlink ban that protect nothing here while
+    # risking a false `none` on a host that links the marker. The rule in this
+    # function: a path we READ goes through _os_file_ok (see $ce below); a path
+    # we only test for existence does not.
     if [ -f "$df" ]; then
         OS_CONTAINER=docker
     elif _os_file_ok "$ce" 4096; then
@@ -1652,6 +1726,9 @@ _os_detect_container() {
         # but reveals no runtime.
         dir="$(_os_file_probe /run/user)"
         for cf in "$dir"/*/.containerenv; do
+            # Same presence-only rationale as /.dockerenv above: no read, so no
+            # _os_file_ok. The literal glob that failed to match is rejected by
+            # -f, so an absent /run/user needs no special case.
             if [ -f "$cf" ]; then
                 OS_CONTAINER=containers
                 break

@@ -26,8 +26,10 @@ printf 'platform: %s/%s on %s\n' "$OS_ID" "$OS_ARCH" "$OS_DISTRO"
 
 ## API contract
 
-All field functions echo their value on stdout with rc 0. They echo an empty
-string when the field was not detected (never trip `set -u`).
+Every field function except `os_detected` echoes its value on stdout with rc 0.
+They echo an empty string when the field was not detected (never trip `set -u`).
+`os_detected` is the exception: it is a boolean guard, echoes nothing, and
+returns `0` iff detection succeeded — use it as `if os_detected; then`.
 
 | Function          | stdout                          | rc            |
 | ----------------- | ------------------------------- | ------------- |

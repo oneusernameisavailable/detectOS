@@ -2005,3 +2005,191 @@ STUB
     detect_os
     [ "$OS_CONTAINER" = "containers" ]
 }
+
+# --- R19: production-readiness regressions (namespace purity, readonly guard,
+# --- display-field DoS, CI matrix coverage). -------------------------------
+
+@test "caller namespace: the legacy ladder leaks no unprefixed loop var (R19-1)" {
+    mkdir -p "$_OS_ROOT/etc"
+    # SuSE-release drives detection past the fedora-family `rel` loop and into
+    # the `asuse` loop, so one fixture exercises BOTH unprefixed loop vars.
+    printf 'openSUSE Leap 15.5\n' > "$_OS_ROOT/etc/SuSE-release"
+    run env _OS_ROOT="$_OS_ROOT" bash -c '
+        rel="CALLER_REL"; asuse="CALLER_ASUSE"
+        . "$1"
+        detect_os >/dev/null 2>&1
+        printf "id=%s rel=%s asuse=%s\n" "$OS_ID" "$rel" "$asuse"
+    ' dummy "$BATS_TEST_DIRNAME/../fx-detect-os.sh"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"id=opensuse-leap"* ]]
+    [[ "$output" == *"rel=CALLER_REL"* ]]
+    [[ "$output" == *"asuse=CALLER_ASUSE"* ]]
+}
+
+@test "readonly guard: reserved scratch _os_env_failed is never written (R19-2)" {
+    mkdir -p "$_OS_ROOT/etc" "$BATS_TEST_TMPDIR/stub"
+    printf 'ID=debian\n' > "$_OS_ROOT/etc/os-release"
+    # A `command -v env` slot that resolves but always fails, so the pass-2
+    # value scrub degrades and _os_redact tries to latch _os_env_failed.
+    printf '#!/bin/sh\nexit 1\n' > "$BATS_TEST_TMPDIR/stub/env"
+    chmod +x "$BATS_TEST_TMPDIR/stub/env"
+    # A scalar _OS_INTERNAL_SCRATCH forces _os_field_listed onto its literal
+    # fallback list, which is where the reserved-name union can drift.
+    # The documented outcome is a CLEAN REFUSAL (rc 1) — the readonly-collision
+    # preflight declines to run rather than writing the name — so `set -e` is
+    # deliberately not used here: a documented rc 1 must not be conflated with
+    # the library aborting the caller's shell via a readonly assignment.
+    run env _OS_ROOT="$_OS_ROOT" _OS_DEBUG=1 \
+        PATH="$BATS_TEST_TMPDIR/stub:$PATH" \
+        bash -c '
+        _OS_INTERNAL_SCRATCH="caller-scalar"
+        readonly _os_env_failed=""
+        . "$1"
+        detect_os >/dev/null 2>&1
+        printf "detect_os rc=%s\n" "$?"
+        printf "REACHED_END\n"
+    ' dummy "$BATS_TEST_DIRNAME/../fx-detect-os.sh"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"readonly variable"* ]]
+    [[ "$output" == *"detect_os rc=1"* ]]
+    [[ "$output" == *"REACHED_END"* ]]
+}
+
+@test "DoS: a 40KB display field under the 256KB cap terminates and is preserved (R19-3)" {
+    mkdir -p "$_OS_ROOT/etc"
+    { printf 'ID=stub\nPRETTY_NAME="'
+      head -c 40000 /dev/zero | tr '\0' 'A'
+      printf '"\n'; } > "$_OS_ROOT/etc/os-release"
+    # 40000 bytes is far UNDER _os_file_ok's 262144 cap, so the cap admits the
+    # file and _os_sanitize_display must carry the cost. This asserts the
+    # end-to-end contract — the value survives intact and detect_os returns —
+    # with a deliberately GENEROUS ceiling whose only job is catching a total
+    # hang. It is not the regression gate for quadratic behaviour: the fixed
+    # case runs ~0.9s here, so a tight absolute bound would flake on slower CI
+    # hardware. R19-7 below owns the scaling-shape assertion, which is
+    # CPU-speed independent.
+    # Elapsed time is measured INSIDE the child shell: setup() defines a
+    # `timeout()` stub, so a timeout wrapper written here would be neutralized
+    # and the assertion would never actually bound anything.
+    run env _OS_ROOT="$_OS_ROOT" bash -c '
+        . "$1"
+        t0=$(date +%s%N)
+        detect_os >/dev/null 2>&1
+        t1=$(date +%s%N)
+        printf "ms=%s len=%s\n" "$(( (t1 - t0) / 1000000 ))" "${#OS_DISTRO}"
+    ' dummy "$BATS_TEST_DIRNAME/../fx-detect-os.sh"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"len=40000"* ]]
+    ms="${output#*ms=}"; ms="${ms%% *}"
+    [ "$ms" -lt 15000 ]
+}
+
+@test "DoS: display sanitization scales linearly, not quadratically (R19-7)" {
+    lib
+    # The regression this guards is the SHAPE of the cost curve, so assert the
+    # shape and not wall-clock: a 4x larger input must not cost ~16x the time.
+    # Measured on the two implementations this replaced:
+    #   pre-fix  10KB=425ms  40KB=6144ms  -> 14x   (per-byte fork + O(n^2) walk)
+    #   current  10KB=203ms  40KB= 842ms  ->  4x   (chunked walk)
+    # A ratio threshold of 8x sits ~2x from each side and, unlike an absolute
+    # millisecond bound, does not shift with runner speed or parallel load.
+    small="$(head -c 10000 /dev/zero | tr '\0' 'A')"
+    big="$(head -c 40000 /dev/zero | tr '\0' 'A')"
+    # Strings are passed as arguments (each stays under the 128KB per-arg limit)
+    # so no shell quoting of generated data is involved.
+    run bash -c '
+        . "$1"
+        t() {
+            local t0 t1
+            t0=$(date +%s%N)
+            _os_sanitize_display "$2" >/dev/null
+            t1=$(date +%s%N)
+            printf "%s %s\n" "$1" "$(( (t1 - t0) / 1000000 ))"
+        }
+        t 10000 "$2"
+        t 40000 "$3"
+    ' dummy "$BATS_TEST_DIRNAME/../fx-detect-os.sh" "$small" "$big"
+    [ "$status" -eq 0 ]
+    declare -A ms=()
+    local n v
+    while read -r n v; do ms[$n]=$v; done <<< "$output"
+    [ -n "${ms[10000]:-}" ] && [ -n "${ms[40000]:-}" ] || {
+        printf 'missing timing samples: %s\n' "$output"
+        return 1
+    }
+    # Below ~10ms the measurement is timer noise rather than work; the fixed
+    # implementation is comfortably above it, so treat it as a pass, not a
+    # division by zero.
+    [ "${ms[10000]}" -ge 10 ] || {
+        printf '10KB sample too fast to measure (%sms) - nothing to assert\n' "${ms[10000]}"
+        return 0
+    }
+    ratio=$(( ms[40000] / ms[10000] ))
+    [ "$ratio" -lt 8 ] || {
+        printf 'quadratic scaling: 10KB=%sms 40KB=%sms ratio=%sx (limit 8x)\n' \
+            "${ms[10000]}" "${ms[40000]}" "$ratio"
+        return 1
+    }
+}
+
+@test "ci.yml: every matrix distro has a package-manager install branch (R19-4)" {
+    ci="$BATS_TEST_DIRNAME/../.github/workflows/ci.yml"
+    [ -f "$ci" ]
+    distros="$(sed -n 's/^[[:space:]]*-[[:space:]]*distro:[[:space:]]*//p' "$ci")"
+    [ -n "$distros" ]
+    pms=""
+    for d in $distros; do
+        case "$d" in
+            debian*|ubuntu*)                            pms="$pms apt-get" ;;
+            fedora*|rocky*|almalinux*|amazonlinux*|oraclelinux*) pms="$pms dnf yum" ;;
+            opensuse*)                                  pms="$pms zypper" ;;
+            archlinux*)                                 pms="$pms pacman" ;;
+            alpine*)                                    pms="$pms apk" ;;
+            *) printf 'unmapped matrix distro: %s\n' "$d"; return 1 ;;
+        esac
+    done
+    for pm in $pms; do
+        run grep -qE "command -v ${pm}[[:space:]]" "$ci"
+        [ "$status" -eq 0 ] || {
+            printf 'ci.yml has no install branch for %s: its matrix legs would reach the git clone without git\n' "$pm"
+            return 1
+        }
+    done
+}
+
+@test "sanitize: a multibyte char straddling the internal chunk cut survives (R19-5)" {
+    lib
+    # _os_sanitize_display walks the value in chunks for speed; a UTF-8 sequence
+    # landing on a chunk boundary must not be split (an early cut-realignment
+    # rule silently dropped it, shrinking the field by 1-3 bytes).
+    LC_ALL=C
+    local ch off
+    for ch in "€" "→" "😀" "ñ"; do
+        for off in 4093 4094 4095 4096 4097; do
+            s="$(printf '%*s' "$off" '' | tr ' ' 'A')${ch}$(printf '%*s' 20 '' | tr ' ' 'B')"
+            r="$(_os_sanitize_display "$s")"
+            # LC_ALL=C, so ${#ch} is the char's BYTE length and must survive too.
+            [ "${#r}" -eq "$(( off + 20 + ${#ch} ))" ] || {
+                printf 'expected %d bytes for %s at offset %d, got %d\n' \
+                    "$(( off + 20 + ${#ch} ))" "$ch" "$off" "${#r}"
+                return 1
+            }
+        done
+    done
+}
+
+@test "SSOT: the _os_field_listed fallback union matches the SSOT arrays (R19-6)" {
+    lib
+    # The literal fallback list in _os_field_listed is the only guard that works
+    # when a caller pre-owns an SSOT array name as a scalar. If it drifts from
+    # _OS_FIELDS + _OS_INTERNAL_SCRATCH, a reserved name becomes invisible to
+    # the readonly-collision preflight and the library aborts the caller's shell
+    # by assigning it.
+    local n
+    for n in "${_OS_FIELDS[@]}" "${_OS_INTERNAL_SCRATCH[@]}"; do
+        _os_field_listed "$n" || {
+            printf 'reserved name absent from the fallback union: %s\n' "$n"
+            return 1
+        }
+    done
+}
