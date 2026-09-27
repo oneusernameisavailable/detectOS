@@ -209,7 +209,7 @@ fi
 if ! declare -p _OS_INTERNAL_SCRATCH >/dev/null 2>&1; then
     readonly -a _OS_INTERNAL_SCRATCH=(_os_last_detail _os_log_file _os_log_ready
                                      _os_steps _os_fn_collision _os_fn_collided
-                                     _os_fn_candidate _os_env_failed)
+                                     _os_fn_candidate _os_env_failed _os_byte_tbl)
 fi
 
 # ---------------------------------------------------------------------------
@@ -324,8 +324,9 @@ _os_ensure_log_file() {
 # WHAT  prints the string JSON-safe (escape \, ", and control chars <0x20).
 #       No external dependencies (pure bash, no process substitution).
 _os_json_escape() {
-    local s="$1" out="" c i code hex
+    local s="$1" out="" c i code hex pre
     local LC_ALL=C
+    _os_byte_table
     for (( i = 0; i < ${#s}; i++ )); do
         c="${s:i:1}"
         case "$c" in
@@ -338,8 +339,9 @@ _os_json_escape() {
                 # printf -v (builtin, no fork) — same reasoning as
                 # _os_sanitize_display: a command substitution here cost one
                 # subshell per character of every logged value.
-                printf -v code '%d' "'$c" 2>/dev/null || continue
-                if [ "${code:-0}" -lt 32 ]; then
+                pre="${_os_byte_tbl%%"$c"*}"
+                code=$(( ${#pre} + 1 ))
+                if [ "$code" -lt 32 ]; then
                     printf -v hex '%04x' "$code"
                     out+="\\u$hex"
                 else
@@ -896,7 +898,7 @@ _os_field_listed() {
              OS_KERNEL_RELEASE OS_CONTAINER OS_SOURCE OS_FALLBACK_USED \
              OS_TRUST_LEVEL _os_last_detail _os_log_file _os_log_ready \
              _os_steps _os_fn_collision _os_fn_collided _os_fn_candidate \
-             _os_env_failed; do
+             _os_env_failed _os_byte_tbl; do
         [ "$n" = "$1" ] && return 0
     done
     return 1
@@ -1082,6 +1084,35 @@ _os_sanitize_version() {
     printf '%s\n' "$s"
 }
 
+# NAME  _os_byte_table
+# ARGS  none
+# WHAT  builds, once per shell, the lookup table _os_byte_tbl: 255 bytes where
+#       index i holds the byte with value i+1. A byte's numeric value is then
+#       the length of the table prefix before that byte's first occurrence, so
+#       the read is two inline assignments and no external command.
+# WHY   bash has no locale-independent way to ask for a single byte's value,
+#       and the usual `printf '%d' "'$c"` trick is glibc-only. musl's C locale
+#       is UTF-8 capable, so bash there returns a WIDE value: byte 0xE2 comes
+#       back as 57314 instead of 226, every multibyte lead byte then misses its
+#       range test, and _os_sanitize_display silently drops ALL non-ASCII on
+#       Alpine. Building the table from explicit \xHH escapes via %b and
+#       indexing it with ${#} is byte-exact on glibc AND musl (both count bytes
+#       under LC_ALL=C), and needs no fork.
+# NOTE  the read is deliberately inlined at the call sites rather than wrapped
+#       in a helper returning stdout: capturing that would need a command
+#       substitution, reintroducing a subshell per byte.
+_os_byte_tbl=""
+_os_byte_table() {
+    [ -n "$_os_byte_tbl" ] && return 0
+    _os_byte_tbl=""
+    local i o ch=""
+    for (( i = 1; i < 256; i++ )); do
+        printf -v o '%02x' "$i"
+        printf -v ch '%b' "\\x$o"
+        _os_byte_tbl+="$ch"
+    done
+}
+
 # NAME  _os_sanitize_display
 # ARGS  raw string
 # WHAT  allowlist-scrubs a human display field (PRETTY_NAME/NAME/VERSION/
@@ -1100,7 +1131,7 @@ _os_sanitize_version() {
 #       bidi-reordering payload, a shell metachar, a glob pattern, or an
 #       unquoted-for-loop word into a caller that interpolates the field.
 _os_sanitize_display() {
-    local s="$1" out="" c i code cp need k ok lidx lead b want have lastc
+    local s="$1" out="" c i code cp need k ok lidx lead b want have lastc pre
     # The walk is CHUNKED, not per-byte over the whole string. bash's
     # ${var:off:len} is O(length-of-var), so indexing a 256KB value once per
     # byte is quadratic: a field admitted by _os_file_ok's 262144-byte cap
@@ -1109,6 +1140,7 @@ _os_sanitize_display() {
     # keeps the per-byte cost constant and the whole pass linear.
     local _CHUNK=4096 rest="$s" piece
     local LC_ALL=C
+    _os_byte_table
     while [ -n "$rest" ]; do
         piece="${rest:0:$_CHUNK}"
         rest="${rest:$_CHUNK}"
@@ -1124,7 +1156,8 @@ _os_sanitize_display() {
         lidx=$(( ${#piece} - 1 )); lead=0; b=0
         while [ "$b" -lt 4 ] && [ "$lidx" -ge 0 ]; do
             lastc="${piece:lidx:1}"
-            printf -v code '%d' "'$lastc" 2>/dev/null || break
+            pre="${_os_byte_tbl%%"$lastc"*}"
+            code=$(( ${#pre} + 1 ))
             [ "$code" -lt 128 ] && break            # ASCII: a character terminus
             if [ "$code" -ge 194 ] && [ "$code" -le 244 ]; then lead=$code; break; fi
             b=$(( b + 1 )); lidx=$(( lidx - 1 ))
@@ -1151,8 +1184,8 @@ _os_sanitize_display() {
             # Non-allowlisted byte: numeric value. `printf -v` is a BUILTIN, so
             # the byte value costs no fork; the previous command substitution
             # forked a subshell for EVERY byte.
-            printf -v code '%d' "'$c" 2>/dev/null || { code=""; continue; }
-            [ -n "$code" ] || continue
+            pre="${_os_byte_tbl%%"$c"*}"
+            code=$(( ${#pre} + 1 ))
             # < 128 is disallowed ASCII (quotes, backslash, glob/brace/shell
             # metachars, C0 controls, DEL).
             [ "$code" -lt 128 ] && continue
@@ -1169,7 +1202,8 @@ _os_sanitize_display() {
             for (( k = 1; k <= need; k++ )); do
                 [ $(( i + k )) -lt "${#piece}" ] || { ok=0; break; }
                 c="${piece:i+k:1}"
-                printf -v code '%d' "'$c" 2>/dev/null || { ok=0; break; }
+                pre="${_os_byte_tbl%%"$c"*}"
+                code=$(( ${#pre} + 1 ))
                 if [ "$code" -lt 128 ] || [ "$code" -gt 191 ]; then ok=0; break; fi
                 cp=$(( (cp << 6) | (code & 63) ))
             done
