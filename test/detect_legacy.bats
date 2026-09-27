@@ -27,6 +27,12 @@
 setup() {
     LIB="$BATS_TEST_DIRNAME/../fx-detect-os.sh"
     MARKER=""
+    # This file plants real marker files in /etc on purpose: its whole point is
+    # to exercise the legacy ladder against a real filesystem with a real
+    # stat/wc rather than an _OS_ROOT fixture. That needs a writable /etc, which
+    # the `legacy` CI job has (root in a container). Run as a normal user it
+    # would otherwise just emit "Permission denied" and look broken.
+    [ -w /etc ] || skip "needs a writable /etc; the legacy CI job runs as root in a container"
 }
 
 # plant a legacy marker file and detect

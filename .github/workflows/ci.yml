@@ -153,12 +153,15 @@ jobs:
         run: |
           git clone --depth 1 --branch "$BATS_VERSION" https://github.com/bats-core/bats-core.git /tmp/bats-core
           /tmp/bats-core/install.sh /usr/local
-          # nixos/nix does not have /usr/local/bin on PATH, so install.sh's
-          # success is invisible without this. Harmless elsewhere.
-          echo "/usr/local/bin" >> "$GITHUB_PATH"
-          bats --version
+          # Absolute path, not PATH manipulation. nixos/nix has no
+          # /usr/local/bin on PATH, and GITHUB_PATH is the wrong tool for it:
+          # it only affects LATER steps, so `bats` was still not found in this
+          # one -- and writing it broke the openSUSE legs outright, whose next
+          # step then failed to exec "sh" at all. Naming the binary works
+          # everywhere and needs no global state.
+          /usr/local/bin/bats --version
       - name: Run bats suite
-        run: bats test/detect_os.bats
+        run: /usr/local/bin/bats test/detect_os.bats
       - name: Run bash 4.0 smoke test
         run: bash test/bash40_smoke.sh fx-detect-os.sh
       - name: Run fuzz tests
@@ -206,11 +209,11 @@ jobs:
         run: |
           git clone --depth 1 --branch "$BATS_VERSION" https://github.com/bats-core/bats-core.git /tmp/bats-core
           /tmp/bats-core/install.sh /usr/local
-          bats --version
+          /usr/local/bin/bats --version
       - name: Run legacy-ladder suite
         run: |
           rm -f /etc/os-release /usr/lib/os-release /etc/debian_version /etc/lsb-release
-          bats test/detect_legacy.bats
+          /usr/local/bin/bats test/detect_legacy.bats
 
   bash40:
     # The header declares a bash >= 4.0 floor. Nothing else in this workflow

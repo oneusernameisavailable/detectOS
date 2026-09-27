@@ -2338,10 +2338,16 @@ STUB
         case "$d" in nixos*) nixos_leg=1 ;; esac
     done
     [ "$nixos_leg" -eq 1 ] || { printf 'no nixos leg in the matrix\n'; return 1; }
-    # 1. install.sh writes /usr/local/bin/bats, but nixos/nix has no
-    #    /usr/local/bin on PATH, so `bats` is otherwise "command not found".
-    run grep -q 'GITHUB_PATH' "$ci"
-    [ "$status" -eq 0 ] || { printf 'bats install does not extend GITHUB_PATH; nixos cannot find bats\n'; return 1; }
+    # 1. bats must be invoked by ABSOLUTE path. nixos/nix has no /usr/local/bin
+    #    on PATH. The first attempt fixed that with a GITHUB_PATH write, which
+    #    is wrong twice over: GITHUB_PATH only affects LATER steps, so `bats` was
+    #    still not found in the step that installed it -- and the write broke
+    #    the openSUSE legs, whose next step could no longer exec "sh".
+    run grep -nE '^[[:space:]]*(run:[[:space:]]*)?bats[[:space:]]' "$ci"
+    [ "$status" -ne 0 ] || {
+        printf 'a bare `bats` invocation depends on PATH; nixos cannot find it:\n%s\n' "$output"
+        return 1
+    }
     # 2. nixos matches no apt/dnf/yum/zypper/apk/pacman branch. The chain must
     #    therefore have no `else` arm that would treat that as an error.
     prereq="$(while IFS= read -r l; do printf '%s\n' "$l"; done < "$ci")"
