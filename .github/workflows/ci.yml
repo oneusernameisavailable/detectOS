@@ -41,6 +41,7 @@ jobs:
           shellcheck --shell=bash test/fuzz_redact.sh
           shellcheck --shell=bash test/fuzz_sanitize.sh
           shellcheck --shell=bash test/detect_os.bats
+          shellcheck --shell=bash test/detect_legacy.bats
 
   bats:
     runs-on: ubuntu-latest
@@ -49,8 +50,6 @@ jobs:
       matrix:
         include:
           # Debian family
-          - distro: debian:12
-            label: debian-12
           - distro: debian:13
             label: debian-13
           # debian:11 was removed: bullseye is EOL, deb.debian.org 404s its
@@ -59,10 +58,14 @@ jobs:
           # installed"). Keeping it green would need a pinned
           # snapshot.debian.org timestamp or --allow-downgrades, which rots in
           # a different way every time the archive shifts.
+          # debian:12 was also dropped: it resolves through /usr/lib/os-release
+          # exactly like debian:13, so it added run time, not coverage. The
+          # debian:12-slim leg below keeps the debian-family slot and adds the
+          # stripped-toolbox case that a full image does not.
           - distro: ubuntu:24.04
             label: ubuntu-24.04
-          - distro: ubuntu:22.04
-            label: ubuntu-22.04
+          # ubuntu:22.04 dropped: same /usr/lib/os-release path as 20.04 and
+          # 24.04. At most two versions per family, oldest-LTS and newest.
           - distro: ubuntu:20.04
             label: ubuntu-20.04
           # RHEL family
@@ -79,8 +82,7 @@ jobs:
             label: fedora-41
           - distro: fedora:40
             label: fedora-40
-          - distro: fedora:39
-            label: fedora-39
+          # fedora:39 dropped: same os-release path as 40/41.
           # SUSE family
           - distro: opensuse/tumbleweed:latest
             label: opensuse-tumbleweed
@@ -89,12 +91,24 @@ jobs:
           # Arch family
           - distro: archlinux:latest
             label: arch-latest
-          # Alpine family
+          # Alpine family. BOTH musl versions are kept deliberately: they are
+          # not redundant. The musl C locale is UTF-8 capable, so bash's
+          # `printf '%d' "'$c"` returns a wide value there and the sanitizer
+          # used to strip every non-ASCII character on Alpine. That class of bug
+          # is invisible on glibc and only shows up across musl versions.
           - distro: alpine:3.21
             label: alpine-3.21
           - distro: alpine:3.20
             label: alpine-3.20
-          # Minimal-distro coverage (no lsb_release, stripped base image).
+          # NixOS. The only leg with NO /etc/os-release and no
+          # /usr/lib/os-release, so the ladder falls all the way through to the
+          # uname last resort (OS_ID=linux, OS_TRUST_LEVEL=low, source=uname).
+          # Every other image short-circuits at step 1, so this is the only
+          # real-image coverage of the low-trust path. Pinned because
+          # nixos/nix:latest is a moving tag.
+          - distro: nixos/nix:2.24.9
+            label: nixos-2.24.9
+          # Minimal-distro coverage (stripped base image).
           # This is NOT a bash 4.0 test: the install step above pulls the
           # DISTRO's bash, which is 5.2 on bookworm. The declared bash >= 4.0
           # floor is enforced by the separate `bash40` job, which runs the real
@@ -125,6 +139,10 @@ jobs:
           elif command -v pacman &>/dev/null; then
             pacman -Sy --noconfirm git bash coreutils
           fi
+          # No else on purpose: nixos/nix has no apt/dnf/yum/zypper/apk/pacman
+          # and needs nothing installed — bash, git, coreutils, timeout and
+          # grep are all already in /root/.nix-profile/bin. A host that matches
+          # no branch is legitimate, not a failure.
           bash --version | head -1
           git --version
       - name: Checkout repo
@@ -135,24 +153,10 @@ jobs:
         run: |
           git clone --depth 1 --branch "$BATS_VERSION" https://github.com/bats-core/bats-core.git /tmp/bats-core
           /tmp/bats-core/install.sh /usr/local
+          # nixos/nix does not have /usr/local/bin on PATH, so install.sh's
+          # success is invisible without this. Harmless elsewhere.
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
           bats --version
-      # lsb_release is OPTIONAL by design — the library's own header calls it
-      # opportunistic, the file-based ladder steps are authoritative, and the
-      # bats setup() stubs lsb_release as a shell function so the suite never
-      # needs the real binary. Oracle Linux has no `redhat-lsb-core` package at
-      # all, so a missing one must not fail the leg.
-      - name: Install lsb_release
-        continue-on-error: true
-        run: |
-          if command -v apt-get &>/dev/null; then
-            apt-get install -y -qq lsb-release
-          elif command -v dnf &>/dev/null; then
-            dnf install -y -q redhat-lsb-core
-          elif command -v zypper &>/dev/null; then
-            zypper --non-interactive --quiet install lsb-release
-          elif command -v apk &>/dev/null; then
-            apk add --no-cache lsb-release
-          fi
       - name: Run bats suite
         run: bats test/detect_os.bats
       - name: Run bash 4.0 smoke test
@@ -162,6 +166,51 @@ jobs:
           bash test/fuzz_detect.sh fx-detect-os.sh
           bash test/fuzz_redact.sh fx-detect-os.sh
           bash test/fuzz_sanitize.sh fx-detect-os.sh
+      # The nixos leg earns its slot ONLY by having no os-release, so the ladder
+      # falls through to the uname last resort. If a future nixos/nix ships one,
+      # this leg silently becomes a 17th redundant os-release run and the whole
+      # matrix gets a false sense of coverage. Assert the property instead of
+      # trusting the tag. The Nix version itself is irrelevant to the library
+      # (bash 4.0 floor is the bash40 job's job), so pinning the tag is enough
+      # for reproducibility -- but this assertion is what keeps the leg honest.
+      - name: Assert this leg still exercises the uname last resort
+        if: matrix.label == 'nixos-2.24.9'
+        run: |
+          if [ -f /etc/os-release ] || [ -f /usr/lib/os-release ]; then
+            echo "::error::the nixos image now ships an os-release, so this leg no longer covers the uname last resort"
+            exit 1
+          fi
+          bash -c 'source fx-detect-os.sh; detect_os
+            printf "id=%s trust=%s source=%s\n" "$OS_ID" "$OS_TRUST_LEVEL" "$OS_SOURCE"
+            [ "$OS_ID" = linux ] && [ "$OS_TRUST_LEVEL" = low ] && [ "$OS_SOURCE" = uname ]'
+
+  legacy:
+    # Ladder steps 2-5 on a REAL image. Every distro image in the matrix ships
+    # a conforming /etc/os-release, so the ladder always short-circuits at step
+    # 1 and the legacy branches are unreachable no matter how many images are
+    # added. (The nixos leg is the exception and covers the uname last resort.)
+    # This job strips the spec files so the file-based branches actually run
+    # against a real filesystem with real stat/wc, instead of only under a
+    # _OS_ROOT fixture. debian_version must go too: it is the FIRST legacy
+    # check, so leaving it in place short-circuits everything after it.
+    runs-on: ubuntu-latest
+    container:
+      image: debian:12-slim
+    steps:
+      - name: Install prerequisites
+        run: |
+          apt-get update -qq && apt-get install -y -qq git bash coreutils
+      - name: Checkout repo
+        run: git clone --depth 1 https://github.com/oneusernameisavailable/detectOS.git .
+      - name: Install bats from source
+        run: |
+          git clone --depth 1 --branch "$BATS_VERSION" https://github.com/bats-core/bats-core.git /tmp/bats-core
+          /tmp/bats-core/install.sh /usr/local
+          bats --version
+      - name: Run legacy-ladder suite
+        run: |
+          rm -f /etc/os-release /usr/lib/os-release /etc/debian_version /etc/lsb-release
+          bats test/detect_legacy.bats
 
   bash40:
     # The header declares a bash >= 4.0 floor. Nothing else in this workflow

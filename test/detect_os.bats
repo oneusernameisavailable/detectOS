@@ -25,6 +25,10 @@
 setup() {
     export _OS_ROOT="$BATS_TEST_TMPDIR/root"
     mkdir -p "$_OS_ROOT/etc"
+    # Pristine PATH, restored by teardown(). See the teardown comment: several
+    # tests set PATH=/nonexistent to exercise the library's tool-absent
+    # degradation and then restore it by hand.
+    _OS_PATH_PRISTINE="$PATH"
     # Neutralize a host-installed lsb_release so file-based fixtures decide
     # the ladder outcome in every test. The stub is invoked by the library's
     # steps, so SC2317 (0.10) / SC2329 (0.11) — no local callers — do not apply.
@@ -40,6 +44,18 @@ setup() {
 
 lib() {
     . "$BATS_TEST_DIRNAME/../fx-detect-os.sh"
+}
+
+teardown() {
+    # Eight tests set PATH=/nonexistent (or "") to exercise the library's
+    # behaviour when its external tools are missing, and each restores it by
+    # hand to a HARDCODED /usr/bin:/bin. That is wrong anywhere the tools are not
+    # there: nixos/nix keeps everything in /root/.nix-profile/bin and has no
+    # /usr/bin at all, so the hand-restore left bats' own per-test cleanup unable
+    # to find `rm`. The result was 172 passing tests and a non-zero exit, i.e. a
+    # red CI leg with no failing test to act on. Restore the PATH we were given.
+    PATH="$_OS_PATH_PRISTINE"
+    export PATH
 }
 
 @test "internal _OS_VERSION name is safe to own before sourcing" {
@@ -2139,7 +2155,16 @@ STUB
 @test "ci.yml: every matrix distro has a package-manager install branch (R19-4)" {
     ci="$BATS_TEST_DIRNAME/../.github/workflows/ci.yml"
     [ -f "$ci" ]
-    distros="$(sed -n 's/^[[:space:]]*-[[:space:]]*distro:[[:space:]]*//p' "$ci")"
+    # Pure bash extraction, no sed/awk/grep: the nixos leg ships neither, and a
+    # meta-test that needs a tool the matrix does not guarantee is exactly how
+    # the ripgrep dependency went unnoticed (R18-402 passed vacuously, D3
+    # failed on every leg).
+    distros=""
+    while IFS= read -r line; do
+        case "$line" in
+            *"- distro:"*) distros="$distros ${line##*- distro:}" ;;
+        esac
+    done < "$ci"
     [ -n "$distros" ]
     pms=""
     for d in $distros; do
@@ -2149,6 +2174,10 @@ STUB
             opensuse*)                                  pms="$pms zypper" ;;
             archlinux*)                                 pms="$pms pacman" ;;
             alpine*)                                    pms="$pms apk" ;;
+            # nixos/nix matches no package manager and needs none installed:
+            # bash, git, coreutils, timeout and grep are already in
+            # /root/.nix-profile/bin. Nothing to assert, so nothing is claimed.
+            nixos*)                                     ;;
             *) printf 'unmapped matrix distro: %s\n' "$d"; return 1 ;;
         esac
     done
@@ -2219,4 +2248,110 @@ STUB
         printf 'EL branch installs coreutils again (conflicts with coreutils-single):\n%s\n' "$output"
         return 1
     }
+}
+
+@test "legacy gentoo-release marker resolves to gentoo (R19-9)" {
+    # Zero coverage before this: nothing in the suite referenced gentoo, and no
+    # gentoo container image is published, so a fixture is the only way to reach
+    # this named branch of the legacy ladder.
+    printf '%s\n' 'Gentoo Base System 2.14' > "$_OS_ROOT/etc/gentoo-release"
+    lib
+    detect_os
+    [ "$OS_ID" = "gentoo" ]
+    [ "$OS_TRUST_LEVEL" = "medium" ]   # named branch, not the catch-all "low"
+    [ "$OS_SOURCE" = "$_OS_ROOT/etc/gentoo-release" ]
+    [ "$OS_VERSION_ID" = "2.14" ]
+}
+
+@test "legacy alpine-release marker resolves to alpine (R19-10)" {
+    # Alpine has a matrix leg, but it ships an os-release, so the ladder stops
+    # at step 1 and this named legacy branch was never exercised.
+    printf '%s\n' '3.21.0' > "$_OS_ROOT/etc/alpine-release"
+    lib
+    detect_os
+    [ "$OS_ID" = "alpine" ]
+    [ "$OS_TRUST_LEVEL" = "medium" ]
+    [ "$OS_SOURCE" = "$_OS_ROOT/etc/alpine-release" ]
+    [ "$OS_VERSION_ID" = "3.21.0" ]
+}
+
+@test "ladder step 3: the lsb_release command resolves identity with no spec file (R19-11)" {
+    # Ladder step 3 is unreachable through a fixture BY DESIGN: the library
+    # disables the command under _OS_ROOT (host isolation -- the pinned binary
+    # would answer for the host), and without _OS_ROOT the real os-release wins
+    # at step 1. It is reachable only on a host that ships NO os-release at all,
+    # which in our matrix is the NixOS leg. So this skips everywhere else rather
+    # than pretending to cover the path.
+    if [ -f /etc/os-release ] || [ -f /usr/lib/os-release ]; then
+        skip "host ships an os-release; ladder step 3 is unreachable here"
+    fi
+    stubdir="$BATS_TEST_TMPDIR/lsbcmd"
+    mkdir -p "$stubdir"
+    cat > "$stubdir/lsb_release" <<'STUB'
+#!/bin/sh
+case "$1" in
+    -is) printf '%s\n' legacyco ;;
+    -rs) printf '%s\n' 4.1 ;;
+    -cs) printf '%s\n' legacyname ;;
+    -ds) printf '%s\n' 'LegacyCo 4.1 (cog)' ;;
+    *)   exit 1 ;;
+esac
+STUB
+    chmod +x "$stubdir/lsb_release"
+    # PATH must be set BEFORE sourcing: _OS_LSBRELEASE is pinned at source time.
+    # -u _OS_ROOT is required, not cosmetic: bats setup() exports _OS_ROOT, and
+    # the library deliberately disables the lsb_release command when a root
+    # prefix is set (host isolation -- the pinned binary would answer for the
+    # host). Inherit it and this test silently measures the guard instead of the
+    # ladder step.
+    run env -u _OS_ROOT PATH="$stubdir:$PATH" bash -c '
+        . "$1"
+        detect_os
+        printf "id=%s ver=%s codename=%s trust=%s source=%s\n" \
+            "$OS_ID" "$OS_VERSION_ID" "$OS_VERSION_CODENAME" \
+            "$OS_TRUST_LEVEL" "$OS_SOURCE"
+    ' dummy "$BATS_TEST_DIRNAME/../fx-detect-os.sh"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"id=legacyco"* ]]
+    [[ "$output" == *"ver=4.1"* ]]
+    [[ "$output" == *"trust=medium"* ]]
+    [[ "$output" == *"source=lsb_release-command"* ]]
+}
+
+@test "ci.yml: the nixos leg is wired for a host with no package manager (R19-12)" {
+    ci="$BATS_TEST_DIRNAME/../.github/workflows/ci.yml"
+    [ -f "$ci" ]
+    # The nixos leg is the only one with no /etc/os-release, so it is the only
+    # real-image coverage of the uname last resort. Three things will silently
+    # break it, and none of them would fail an obvious test elsewhere:
+    # Distros are extracted from the matrix rather than grepped for the string,
+    # because the surrounding comments also mention nixos/nix (and a comment
+    # satisfying a grep is exactly the kind of false green to avoid).
+    distros=""
+    while IFS= read -r line; do
+        case "$line" in
+            *"- distro:"*) distros="$distros ${line##*- distro:}" ;;
+        esac
+    done < "$ci"
+    nixos_leg=0
+    for d in $distros; do
+        case "$d" in nixos*) nixos_leg=1 ;; esac
+    done
+    [ "$nixos_leg" -eq 1 ] || { printf 'no nixos leg in the matrix\n'; return 1; }
+    # 1. install.sh writes /usr/local/bin/bats, but nixos/nix has no
+    #    /usr/local/bin on PATH, so `bats` is otherwise "command not found".
+    run grep -q 'GITHUB_PATH' "$ci"
+    [ "$status" -eq 0 ] || { printf 'bats install does not extend GITHUB_PATH; nixos cannot find bats\n'; return 1; }
+    # 2. nixos matches no apt/dnf/yum/zypper/apk/pacman branch. The chain must
+    #    therefore have no `else` arm that would treat that as an error.
+    prereq="$(while IFS= read -r l; do printf '%s\n' "$l"; done < "$ci")"
+    case "$prereq" in
+        *"elif command -v pacman"*) ;;
+        *) printf 'prereq chain lost its last elif; the no-package-manager fall-through is unverified\n'; return 1 ;;
+    esac
+    # 3. the lsb_release install step is unreachable on every image (the
+    #    command step needs BOTH os-release and the lsb-release file absent) and
+    #    already failed the Oracle leg once. It must not come back.
+    run grep -q "Install lsb_release" "$ci"
+    [ "$status" -ne 0 ] || { printf 'Install lsb_release is back; it is unreachable and was an Oracle failure source\n'; return 1; }
 }
