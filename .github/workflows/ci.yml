@@ -53,8 +53,12 @@ jobs:
             label: debian-12
           - distro: debian:13
             label: debian-13
-          - distro: debian:11
-            label: debian-11
+          # debian:11 was removed: bullseye is EOL, deb.debian.org 404s its
+          # packages, and archive.debian.org has broken perl-base pinning
+          # ("perl-base (= 5.32.1-4+deb11u3) but 5.32.1-4+deb11u5 is to be
+          # installed"). Keeping it green would need a pinned
+          # snapshot.debian.org timestamp or --allow-downgrades, which rots in
+          # a different way every time the archive shifts.
           - distro: ubuntu:24.04
             label: ubuntu-24.04
           - distro: ubuntu:22.04
@@ -107,9 +111,13 @@ jobs:
           if command -v apt-get &>/dev/null; then
             apt-get update -qq && apt-get install -y -qq git bash coreutils
           elif command -v dnf &>/dev/null; then
-            dnf install -y -q git bash coreutils
+            # No coreutils: EL9 images ship coreutils-single, and pulling the
+            # coreutils metapackage conflicts with it ("cannot install the best
+            # candidate"), which failed rocky/almalinux/amazonlinux. The wc,
+            # stat and mktemp the library uses already come from coreutils-single.
+            dnf install -y -q git bash
           elif command -v yum &>/dev/null; then
-            yum install -y -q git bash coreutils
+            yum install -y -q git bash
           elif command -v zypper &>/dev/null; then
             zypper --non-interactive --quiet install git bash coreutils
           elif command -v apk &>/dev/null; then
@@ -128,7 +136,13 @@ jobs:
           git clone --depth 1 --branch "$BATS_VERSION" https://github.com/bats-core/bats-core.git /tmp/bats-core
           /tmp/bats-core/install.sh /usr/local
           bats --version
+      # lsb_release is OPTIONAL by design — the library's own header calls it
+      # opportunistic, the file-based ladder steps are authoritative, and the
+      # bats setup() stubs lsb_release as a shell function so the suite never
+      # needs the real binary. Oracle Linux has no `redhat-lsb-core` package at
+      # all, so a missing one must not fail the leg.
       - name: Install lsb_release
+        continue-on-error: true
         run: |
           if command -v apt-get &>/dev/null; then
             apt-get install -y -qq lsb-release

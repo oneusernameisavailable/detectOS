@@ -1870,7 +1870,11 @@ STUB
     [[ "$output" == *"[REDACTED]"* ]]
 }
 @test "bash4.0: error-log mode check never uses negative-offset substring (R18-402)" {
-    rg -n '\$\{emode: -' "$BATS_TEST_DIRNAME/../fx-detect-os.sh" && return 1
+    # grep -F, not a regex: this looks for the LITERAL bash negative-offset
+    # spelling. This previously used ripgrep, which no CI container installs —
+    # `rg -n ... && return 1` short-circuited on rc 127 and fell through to
+    # `return 0`, so the test passed WITHOUT ASSERTING ANYTHING on every leg.
+    grep -Fn '${emode: -' "$BATS_TEST_DIRNAME/../fx-detect-os.sh" && return 1
     return 0
 }
 
@@ -1991,8 +1995,8 @@ STUB
     local o1="$BATS_TEST_TMPDIR/o1" o2="$BATS_TEST_TMPDIR/o2"
     _os_redact 'K=V' >"$o1" 2>"$e1"
     _os_redact 'K=V' >"$o2" 2>"$e2"
-    rg -q 'osdetect: caller-supplied _OS_ENV|environment value-scrub is OFF' "$e1" || return 1
-    if rg -q 'osdetect: caller-supplied _OS_ENV' "$e2"; then return 1; fi
+    grep -Eq 'osdetect: caller-supplied _OS_ENV|environment value-scrub is OFF' "$e1" || return 1
+    if grep -Eq 'osdetect: caller-supplied _OS_ENV' "$e2"; then return 1; fi
 }
 
 @test "container: rootless /run/user/<uid>/.containerenv maps to containers (R18-C5)" {
@@ -2192,4 +2196,27 @@ STUB
             return 1
         }
     done
+}
+
+@test "ci.yml: the suite needs no ripgrep, and EL legs skip coreutils (R19-8)" {
+    ci="$BATS_TEST_DIRNAME/../.github/workflows/ci.yml"
+    batsf="$BATS_TEST_DIRNAME/detect_os.bats"
+    [ -f "$ci" ] && [ -f "$batsf" ]
+    # Real CI installs no ripgrep, and two tests called `rg`. Test D3 failed on
+    # every leg because of it, and R18-402 silently PASSED WITHOUT ASSERTING
+    # ANYTHING (the rg call short-circuited on rc 127, then `return 0`).
+    # grep is present everywhere, so the dependency is removed, not installed.
+    # `^[^#]*` skips comments; `r[g]` keeps the pattern from matching itself.
+    run grep -nE '^[^#]*([^a-zA-Z_-])r[g] -' "$batsf"
+    [ "$status" -ne 0 ] || {
+        printf 'test suite calls ripgrep again; CI installs none:\n%s\n' "$output"
+        return 1
+    }
+    # EL9 images ship coreutils-single; `dnf install coreutils` conflicts with
+    # it and failed rocky/almalinux/amazonlinux at Install prerequisites.
+    run grep -nE '(dnf|yum) install[^\n]*\bcoreutils\b' "$ci"
+    [ "$status" -ne 0 ] || {
+        printf 'EL branch installs coreutils again (conflicts with coreutils-single):\n%s\n' "$output"
+        return 1
+    }
 }
