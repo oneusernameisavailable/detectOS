@@ -91,6 +91,20 @@ jobs:
           # Arch family
           - distro: archlinux:latest
             label: arch-latest
+          # CachyOS: a rolling Arch derivative, and the distro this library is
+          # actually used on. Two caveats worth knowing before debugging this leg:
+          #  - `:latest` is the ONLY tag CachyOS publishes, because it is a
+          #    rolling release. Same situation as archlinux:latest and
+          #    opensuse/tumbleweed:latest above, so it is consistent practice
+          #    here rather than a new compromise.
+          #  - `pacman -Sy` cannot actually run in the container (it refuses its
+          #    own hooks with "could not isolate the network") yet still exits 0,
+          #    so the install step silently does nothing. The leg only passes
+          #    because the image already ships bash, git and coreutils. If a
+          #    future image drops git, this leg fails at the checkout step rather
+          #    than at the install step that was supposed to provide it.
+          - distro: cachyos/cachyos:latest
+            label: cachyos-latest
           # Alpine family. BOTH musl versions are kept deliberately: they are
           # not redundant. The musl C locale is UTF-8 capable, so bash's
           # `printf '%d' "'$c"` returns a wide value there and the sanitizer

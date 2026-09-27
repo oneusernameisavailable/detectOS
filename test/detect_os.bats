@@ -2173,6 +2173,10 @@ STUB
             fedora*|rocky*|almalinux*|amazonlinux*|oraclelinux*) pms="$pms dnf yum" ;;
             opensuse*)                                  pms="$pms zypper" ;;
             archlinux*)                                 pms="$pms pacman" ;;
+            # CachyOS is an Arch derivative, so the same pacman branch serves it.
+            # Worth its own arm so the relationship is visible here rather than
+            # buried in the archlinux one.
+            cachyos*)                                    pms="$pms pacman" ;;
             alpine*)                                    pms="$pms apk" ;;
             # nixos/nix matches no package manager and needs none installed:
             # bash, git, coreutils, timeout and grep are already in
