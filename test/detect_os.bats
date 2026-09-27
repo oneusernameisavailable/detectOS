@@ -2365,3 +2365,56 @@ STUB
     run grep -q "Install lsb_release" "$ci"
     [ "$status" -ne 0 ] || { printf 'Install lsb_release is back; it is unreachable and was an Oracle failure source\n'; return 1; }
 }
+
+@test "sanitize: every valid UTF-8 lead byte is dispatched, not just 0xC2-0xCF (R19-13)" {
+    lib
+    LC_ALL=C
+    # The lead-byte dispatch used to enumerate 194-207 and silently omit
+    # 208-223 (0xD0-0xDF), which dropped EVERY codepoint in U+0400-U+07FF:
+    # all of Cyrillic, Armenian, Hebrew and Arabic. Found by differential
+    # testing against an independent reference implementation.
+    #
+    # Bytes are given as hex pairs and built with printf, and the EXPECTED
+    # byte count is asserted alongside the round trip. An earlier version of
+    # this test passed `printf '%b' 'U+042F'` -- which %b does not interpret --
+    # so it compared the 6-character literal "U+042F" against itself and
+    # passed without asserting anything. Stating the expected length is what
+    # stops that class of vacuous test from coming back.
+    local -a probe=(
+        "Cyrillic capital YA|d0af|2"
+        "Cyrillic small ya|d18f|2"
+        "Cyrillic ie with grave|d190|2"
+        "Cyrillic capital IO|d081|2"
+        "Armenian capital AYB|d4b1|2"
+        "Hebrew het|d7b7|2"
+        "Hebrew qof|d7a7|2"
+        "Arabic alef|d8a7|2"
+        "Arabic seen|d8b9|2"
+    )
+    local item lbl hex want n b r oct
+    for item in "${probe[@]}"; do
+        IFS='|' read -r lbl hex want <<<"$item"
+        b=""; n=0; hex="${hex// /}"
+        while [ -n "$hex" ]; do
+            # octal via %b, with the variable in the ARGUMENT: a variable in a
+            # printf FORMAT string trips SC2059, and %b interprets \0ddd.
+            oct="$(printf '%03o' "0x${hex:0:2}")"
+            b+="$(printf '%b' "\\0$oct")"
+            hex="${hex:2}"
+            n=$(( n + 1 ))
+        done
+        [ "$n" -eq "$want" ] || { printf '%s: built %d bytes, expected %d\n' "$lbl" "$n" "$want"; return 1; }
+        r="$(_os_sanitize_display "$b")"
+        [ "${#r}" -eq "$want" ] || {
+            printf '%s: expected %d bytes out, got %d\n' "$lbl" "$want" "${#r}"
+            return 1
+        }
+    done
+    # Widening the accepted range must not widen what counts as VALID: a
+    # 2-byte overlong encoding decodes below U+0080 and must still be dropped.
+    # (0xD0 0x80 is not overlong -- it is U+0400 -- so the probe must use the
+    # lead where an overlong form is actually representable.)
+    [ -z "$(_os_sanitize_display "$(printf '\xc2\x80')")" ] || {
+        printf 'overlong 0xC2 0x80 was accepted\n'; return 1
+    }
+}

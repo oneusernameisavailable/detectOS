@@ -244,6 +244,32 @@ jobs:
           docker run --rm -v "$PWD:/work:ro" -w /work bash:4.0 \
             bash /work/test/bash40_smoke.sh /work/fx-detect-os.sh
 
+  mutation:
+    # Deliberately NON-BLOCKING (continue-on-error) and deliberately NOT on a
+    # cron. A green suite only means something if its tests can fail: R18-402 was
+    # `rg -n ... && return 1` followed by `return 0`, so with ripgrep absent from
+    # every container it passed WITHOUT ASSERTING ANYTHING, on every leg, for
+    # its whole life, while CI was green. This job breaks the library on purpose
+    # and reports which defects no test notices.
+    #
+    # It is not a required check because a survivor is a prompt to investigate,
+    # not proof of a broken build, and a red mutation job would be easy to
+    # misread. ~12 min for the catalogue; run it ad hoc when touching the
+    # sanitizer, the redaction passes, or the trust ladder.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats
+        run: |
+          git clone --depth 1 --branch "$BATS_VERSION" https://github.com/bats-core/bats-core.git /tmp/bats-core
+          /tmp/bats-core/install.sh /usr/local
+          /usr/local/bin/bats --version
+      - name: Prove the harness cannot touch the real tree
+        run: ./test/mutation.sh --selftest
+      - name: Run the mutation catalogue
+        run: ./test/mutation.sh
+
   quick:
     runs-on: ubuntu-latest
     steps:

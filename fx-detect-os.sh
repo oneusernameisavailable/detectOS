@@ -1163,13 +1163,18 @@ _os_sanitize_display() {
             b=$(( b + 1 )); lidx=$(( lidx - 1 ))
         done
         if [ "$lead" -ge 194 ]; then
-            case "$lead" in
-                194|195|196|197|198|199|200|201|202|203|204|205|206|207) want=2 ;;
-                240|241|242|243|244) want=4 ;;
-                *) want=3 ;;
-            esac
+            # Range tests, not a hand-listed enumeration. A 30-number list is
+            # exactly how 0xD0-0xDF (208-223) came to be missing from the
+            # dispatch below, which silently destroyed every codepoint in
+            # U+0400-U+07FF -- all of Cyrillic, Armenian, Hebrew and Arabic.
+            if   [ "$lead" -le 223 ]; then want=2   # 0xC2-0xDF: 1 continuation
+            elif [ "$lead" -le 239 ]; then want=3   # 0xE0-0xEF: 2 continuations
+            elif [ "$lead" -le 244 ]; then want=4   # 0xF0-0xF4: 3 continuations
+            else                         want=0   # 0xF5-0xFF: never a valid lead
+            fi
+            [ "$want" -ge 2 ] || want=0
             have=$(( ${#piece} - lidx ))
-            while [ "$have" -lt "$want" ] && [ -n "$rest" ]; do
+            while [ "$want" -ge 2 ] && [ "$have" -lt "$want" ] && [ -n "$rest" ]; do
                 piece+="${rest:0:1}"
                 rest="${rest:1}"
                 have=$(( have + 1 ))
@@ -1192,12 +1197,19 @@ _os_sanitize_display() {
             # Multibyte length from the lead byte: C2-DF = 1 continuation,
             # E0-EF = 2, F0-F4 = 3. Overlong leads C0-C1, lone continuation
             # bytes 0x80-BF, and 0xF5-FF are dropped.
-            case "$code" in
-                194|195|196|197|198|199|200|201|202|203|204|205|206|207) need=1; cp=$(( code & 31 )) ;;
-                224|225|226|227|228|229|230|231|232|233|234|235|236|237|238|239) need=2; cp=$(( code & 15 )) ;;
-                240|241|242|243|244) need=3; cp=$(( code & 7 )) ;;
-                *) continue ;;
-            esac
+            # Range tests, not a hand-listed enumeration of the 30 legal lead
+            # bytes. The enumeration that preceded this omitted 208-223
+            # (0xD0-0xDF) and so silently dropped every codepoint in
+            # U+0400-U+07FF: all of Cyrillic, Armenian, Hebrew and Arabic. A
+            # range cannot be silently incomplete.
+            # BOTH bounds are required on every arm: with only an upper bound the
+            # first arm also matched 0x80-0xC1, so a stray continuation byte was
+            # treated as a lead and emitted as garbage.
+            if   [ "$code" -ge 194 ] && [ "$code" -le 223 ]; then need=1; cp=$(( code & 31 ))
+            elif [ "$code" -ge 224 ] && [ "$code" -le 239 ]; then need=2; cp=$(( code & 15 ))
+            elif [ "$code" -ge 240 ] && [ "$code" -le 244 ]; then need=3; cp=$(( code & 7 ))
+            else continue
+            fi
             ok=1
             for (( k = 1; k <= need; k++ )); do
                 [ $(( i + k )) -lt "${#piece}" ] || { ok=0; break; }

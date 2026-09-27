@@ -1,0 +1,58 @@
+# Mutation catalogue for fx-detect-os.sh — see test/mutation.sh for the format.
+#
+# Format (fields separated by ~, which must not appear in any field):
+#   ID ~ TARGET ~ DESCRIPTION ~ TEST_FILTER ~ OLD_LITERAL ~ NEW_LITERAL
+#     ID           short label, printed in the report
+#     TARGET       the function whose behaviour is being broken
+#     DESCRIPTION  what the mutant does, in plain words
+#     TEST_FILTER  bats -f regex for the cheap first pass; anything that
+#                  survives this still gets the FULL suite (see mutation.sh)
+#     OLD_LITERAL  exact text to find in fx-detect-os.sh
+#     NEW_LITERAL  exact replacement
+#
+#   Literals, not regular expressions -- an earlier sed-based version of this
+#   file had 9 rules that silently matched nothing, which is indistinguishable
+#   from a surviving mutant. The harness now asserts OLD_LITERAL occurs EXACTLY
+#   ONCE and reports BROKESED otherwise, so a stale rule can never be mistaken
+#   for a coverage gap.
+#
+# A mutant that no test catches is a finding: either a real coverage gap, or an
+# equivalent mutant (the killed branch was unreachable), which is recorded as a
+# non-finding with a reason rather than treated as suite weakness.
+#
+# The groups mirror the threat model: A = terminal-escape / invisible-character
+# defence in _os_sanitize_display, B = secret leakage in the redaction passes,
+# C = DoS and symlink policy in _os_file_ok, D = ladder ordering and trust
+# levels, E = quoting.
+
+# --- A: _os_sanitize_display — hostile release file -> caller terminal -------
+A01~_os_sanitize_display~allowlist also accepts a double quote~sanitize|C1|hostile|display|metachar~|"@"|"%"|"^")~|"\"|"@"|"%"|"^")~
+A02~_os_sanitize_display~allowlist also accepts a semicolon~sanitize|C1|hostile|display|metachar~|"@"|"%"|"^")~|";"|"@"|"%"|"^")~
+A03~_os_sanitize_display~allowlist also accepts a dollar sign~sanitize|C1|hostile|display|metachar~|"@"|"%"|"^")~|"$"|"@"|"%"|"^")~
+A04~_os_sanitize_display~drop the C1 control (U+0080-U+009F) rejection~C1|RT-C1~|| { [ "$cp" -ge 128 ] && [ "$cp" -le 159 ]; } \~~|| \~
+A05~_os_sanitize_display~drop the 3-byte overlong rejection~sanitize|C1|overlong~|| { [ "$need" -eq 2 ] && [ "$cp" -lt 2048 ]; } \~~|| \~
+A06~_os_sanitize_display~drop the UTF-16 surrogate rejection~sanitize|C1|surrogate~|| { [ "$cp" -ge 55296 ] && [ "$cp" -le 57343 ]; } \~~|| \~
+A07~_os_sanitize_display~drop the noncharacter (U+xFFFE/U+xFFFF) rejection~C1|noncharacter~|| [ $(( cp % 65536 )) -ge 65534 ] \~~|| \~
+A08~_os_sanitize_display~shorten the chunk-boundary scan-back bound (4->3)~R19-5|straddl|multibyte~while [ "$b" -lt 4 ]~while [ "$b" -lt 3 ]~
+
+# --- B: _os_redact / _os_secret_name — secret material escaping the log -------
+B01~_os_secret_name~drop the key/auth word-boundary rule~key|KEY|AUTH|MONKEY|boundary~*[^a-z0-9]key[^a-z0-9]*|*[^a-z0-9]auth[^a-z0-9]*)~*nosuchkey*|*nosuchauth*)~
+B02~_os_secret_name~drop the *pw/*pwd/*passwd tier~pw|passwd|PWD|RT-F5~*pw|*pwd|*passwd)~*nosuchpw*)~
+B03~_os_secret_name~drop the obfuscation/typo tier~obfusc|typo|RT-H5|PASWRD~*pasw*|*secr*|*authid*|*authn*|*keyid*|*keyl*|*crdt*)~*nosuchtier*)~
+B04~_os_redact~drop the pass-3 credential-shape gate~shape|Bearer|AKIA|JWT|R18-S|PEM~*Bearer*|*bearer*|*AKIA*|*ASIA*|*eyJ*|*-----BEGIN*|*PRIVATE*KEY-----*|*private_key*|*privateKey*|*client_secret*|*clientSecret*|*access_token*|*accessToken*|*refresh_token*|*refreshToken*|*api_key*|*apiKey*|*password*|*passphrase*|*secret*|*token*)~*nosuchshape*~
+B05~_os_redact~drop the pass-2a exported array/assoc component scan~assoc|array|export|declare~declare\ -[A-Za-z]*x[A-Za-z]*\ [A-Za-z0-9_]+=\(~declare\ -[A-Za-z]*x[A-Za-z]*\ [A-Za-z0-9_]+=\(zz~
+B06~_os_redact~reverse the value sort to shortest-first (longest no longer wins)~longest|residu|prefix|multi-line~while (( j >= 0 && ${#current} > ${#vals[j]} )); do~while (( j >= 0 && ${#current} < ${#vals[j]} )); do~
+
+# --- C: _os_file_ok — DoS bound and symlink policy ----------------------------
+C01~_os_file_ok~stop rejecting symlinks~symlink~    [ -L "$f" ] && return 1~    : # mutant: symlink check removed~
+C02~_os_file_ok~raise the byte cap 262144 -> 1GiB~cap|oversize|R18-C2~max="${2:-262144}"~max="${2:-1073741824}"~
+C03~_os_file_ok~reject empty files instead of allowing them~empty|0-byte|absent|defer~bytes="$("$_OS_STAT" -c %s "$f" 2>/dev/null)" || return 1~bytes="$("$_OS_STAT" -c %s "$f" 2>/dev/null)" || return 1; [ -n "$bytes" ] || return 1
+
+# --- D: ladder ordering and trust levels --------------------------------------
+D01~_os_read_os_release~stop resetting identity on the /usr/lib takeover~ID-less|usr-lib|paternity|mix~_os_parse_os_release_file "$f_u" reset~_os_parse_os_release_file "$f_u"~
+D02~_os_parse_legacy~raise the catch-all glob from low to medium trust~catch-all|trust|low|R18-A2~OS_ID="$id"; OS_SOURCE="$f"; OS_TRUST_LEVEL=low~OS_ID="$id"; OS_SOURCE="$f"; OS_TRUST_LEVEL=medium~
+D03~_os_read_os_release~lower the os-release spec step from high to medium trust~os-release|trust|high~        OS_TRUST_LEVEL=high~        OS_TRUST_LEVEL=medium~
+
+# --- E: quoting ----------------------------------------------------------------
+E01~_os_unquote~stop stripping single-quoted values~unquote|single|quote~elif [ "${v#\'}" != "$v" ] && [ "${v%\'}" != "$v" ]; then~elif false; then~
+A09~_os_sanitize_display~re-narrow the 2-byte lead range back to 0xC2-0xCF (the original U+0400-U+07FF bug)~sanitize|C1|R19-13|UTF-8|lead~[ "$code" -ge 194 ] && [ "$code" -le 223 ]~[ "$code" -ge 194 ] && [ "$code" -le 207 ]~
