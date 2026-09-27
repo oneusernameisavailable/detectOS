@@ -5,6 +5,11 @@ osdetect-failures.jsonl
 # Transient test artifacts (recreated by the bats suite)
 *.forge/
 evilroot/
+# A `git clone ... repo` run inside a bind-mounted copy of this tree leaves a
+# full second copy here, root-owned because Docker created it. It got committed
+# once as an embedded-repo gitlink before these entries existed.
+repo/
+.stray-clone-from-container/
 
 # Local tooling / eval scaffolding
 .superpowers/
